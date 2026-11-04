@@ -1,99 +1,53 @@
-We are using python 3.14, here is how you reproduce our setup.
+# NLP1 — Project 1
+
+Classify WildGuardMix prompts as harmful or unharmful, excluding the agreed
+`toxic_language_hate_speech` category.
+
+Open the notebooks in this order:
+
+1. [Setup](part1/setup.ipynb) — install dependencies and check Hugging Face access.
+2. [Project 1](part1/project1.ipynb) — prepare data, train models and analyse results.
+
+The project compares indicators, token counts and TF-IDF with logistic regression,
+a one-hidden-layer MLP and a two-hidden-layer MLP. All nine systems use the same
+five stratified folds. The notebook includes macro-F1, error analysis and paired
+Bayesian comparisons with ROPE ±0.01. The official test remains held out.
+
+## Run locally
+
+Use Python 3.14. From the repository root:
 
 ```bash
-python3.14 -m venv ~/envs/nlp1-2026
-source ~/envs/nlp1-2026/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-jupyter lab
+python3.14 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+jupyter lab part1/setup.ipynb
 ```
 
-Each `part{N}` folder contains a tutorial notebook `tutorial.ipynb` and project instructions in `project.ipynb`.
+Select the `.venv` kernel. Accept the dataset conditions on
+[Hugging Face](https://huggingface.co/datasets/allenai/wildguardmix), then run
+`hf auth login` in the activated environment. Each teammate uses their own login.
 
-## Alternatives
+Run Project 1 from top to bottom. The settings cell controls sampling, BPE and
+training. The current defaults are 2,000 prompts per class, 3,000 BPE tokens and
+10 epochs. Set `use_toy_data = True` for a quick offline check; its artificial
+topic labels do not measure harmfulness classification.
 
-### Using `uv`
+Each run saves metrics, hashed-ID predictions, settings and audit counts in a new
+folder under `part1/results/`. These local outputs and caches are ignored by Git.
+Clear notebook outputs before committing. Raw prompts and credentials should
+not be committed.
 
-[`uv`](https://docs.astral.sh/uv/) is a fast, modern Python package manager that is quickly becoming the industry standard. It is fully compliant with Python standards, fully replaces `pip`, and interoperates well with PyTorch. To use it for this project:
+## Code and attribution
 
-1. [Install `uv`](https://docs.astral.sh/uv/getting-started/installation/)
+The workflow stays in notebook code cells. Repeated project operations live in
+[utils/p1/functions.py](utils/p1/functions.py); the Python modules under `part1/`
+are reused course code.
 
-2. Change the working directory:
-
-    ```shell
-    cd ./nlp1-student
-    ```
-
-3. Initialize the project
-
-    ```shell
-    uv init --bare .
-    ```
-
-    Notice the added file `pyproject.toml` file. This is where all metadata about this project/directory gets stored. You can read more about it [here](https://packaging.python.org/en/latest/guides/writing-pyproject-toml/).
-
-    At the moment, it should look something like:
-
-    ```toml
-    [project]
-    name = "nlp1-student"
-    version = "0.1.0"
-    requires-python = ">=3.14"
-    dependencies = []
-    ```
-
-4. Install dependencies
-
-    We're going to read the required dependencies from the provided `requirements.txt` file, and let `uv` handle installing the right versions
-
-    ```shell
-    uv add -r requirements.txt
-    ```
-
-    Note the new folder `.venv`. This is where all our dependencies live. Feel free to delete it once you're done, `uv` can quickly reconstruct it from its cache.
-
-    In `pyproject.toml` the `dependencies` argument is now populated.
-
-We can now use this virtual environment as we before
-
-```shell
-source .venv
-```
-
-Most modern IDEs (e.g., vscode or vscodium) should be able to recognize this virtual environment and load it for you.
-
-### Using `vscode`
-
-[Visual Studio Code (vscode)](https://code.visualstudio.com/) and its open-source twin [vscodium](https://vscodium.com/) are modern language agnostic text editors (read, IDE-lite). You can also use them for working with Jupyter or `.ipynb` notebooks. While these do not enjoy first-class support, the benefit of an IDE is that you can also access the terminal, edit regular `.py` files, and read all other files in the directory.
-
-To use either for this project, we'll need to do a few extra steps.
-
-1. Install and enable the [`Python`](https://open-vsx.org/vscode/item?itemName=ms-python.python) extension
-2. Install and enable the [`Jupyter`](https://open-vsx.org/vscode/item?itemName=ms-toolsai.jupyter) extension
-3. If necessary, install the `jupyter` package
-
-    ```shell
-    uv add jupyter 
-    ```
-
-4. When opening the notebook, use the 'Select kernel' dropdown, and select `.venv` (located as `./.venv/bin/python`)
-
-You should now be able to read, edit and run the various `*.ipynb` notebooks in this directory
-
-You can read more about the features vscode has for notebooks [here](https://code.visualstudio.com/docs/datascience/jupyter-notebooks).
-
-#### Mermaid Diagrams
-
-Some of the notebooks use [`mermaid`](https://mermaid.js.org/) diagrams. For example:
-
-```mermaid
-    flowchart LR
-
-    A["foo"] --> B(bar) --> C["baz"]
-```
-
-If these are not rendering automatically (i.e., you see text instead of a diagram), you might need to upgrade your vscode instance to at least version [1.121.0](https://code.visualstudio.com/updates/v1_121#_mermaid-diagrams-in-markdown-preview-and-notebooks). If this is not possible, you should also be able to replicate this effect by installing the [Markdown Preview Mermaid Support](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid).
-
-## Snellius
-
-If you'd like to run your tutorial notebooks via Snellius, either on CPU or GPU nodes, you can follow the instructions found [here](https://docs.google.com/document/d/18Ql8Hv-ibAGCTBvqmPVSaXBNNBSl1mtnpT8tIyoRPZM/edit?usp=sharing).
+This repository retains the history and Apache-2.0 license of
+[nlp-illc/nlp1-student](https://github.com/nlp-illc/nlp1-student), based on commit
+`6d93c951fa2bd0a92b6e90ca954865f1c1165eef`. The original
+[tutorial](https://github.com/nlp-illc/nlp1-student/blob/6d93c951fa2bd0a92b6e90ca954865f1c1165eef/part1/tutorial.ipynb)
+and [assignment](https://github.com/nlp-illc/nlp1-student/blob/6d93c951fa2bd0a92b6e90ca954865f1c1165eef/part1/project.ipynb)
+remain available upstream. `main` contains the team version; exploratory notebooks
+are maintained separately.
