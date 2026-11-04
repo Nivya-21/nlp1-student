@@ -1,99 +1,47 @@
-We are using python 3.14, here is how you reproduce our setup.
+# NLP1 — Project 1
+
+Open these notebooks in order:
+
+1. [part1/setup.ipynb](part1/setup.ipynb): install dependencies and check Hugging Face access. Run this once with the project's Python kernel.
+2. [part1/project1.ipynb](part1/project1.ipynb): the full experiment, explained step by step like the course tutorial.
+3. [part1/project1_experiments.ipynb](part1/project1_experiments.ipynb): a separate exploratory copy comparing 1,500, 4,000 and 8,000 BPE tokens, plus single-setting MLP controls. It explains tokenization versus the three representations and preserves the original notebook/results.
+
+To learn by making your own choices, open
+[part1/project1_learning.ipynb](part1/project1_learning.ipynb). Edit its control
+panel, write a hypothesis, save the notebook, then restart the kernel and run all.
+It starts with one model on one fold. Switch `run_all_folds` to `True` for CV;
+each saved run gets a separate folder under `part1/results/learning/`.
+The notebook includes blank reflection prompts, a history of comparable runs,
+and an optional paired Bayesian comparison. It does not automatically tune models.
+
+The experiment notebook contains data filtering, BPE, the three representations,
+the three models, five-fold cross-validation, Bayesian ROPE and error analysis.
+Reusable encoding and training helpers live in [utils/p1/functions.py](utils/p1/functions.py).
+There is no separate runner or YAML configuration. Change the settings in the notebook.
+The extension runs 150 cross-validation fits on the same sample and folds, saving
+separate outputs under `part1/results/project1_experiments/`. Its rankings are
+exploratory; the official test is not used to select a configuration.
+
+The original [tutorial](part1/tutorial.ipynb), [assignment](part1/project.ipynb),
+course modules and Apache-2.0 license are preserved. The Git history comes from
+[nlp-illc/nlp1-student](https://github.com/nlp-illc/nlp1-student), starting at
+`6d93c951fa2bd0a92b6e90ca954865f1c1165eef`.
+
+Use Python 3.14 and select the `.venv` kernel. The environment on this Mac is
+already set up. From the repository root:
 
 ```bash
-python3.14 -m venv ~/envs/nlp1-2026
-source ~/envs/nlp1-2026/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-jupyter lab
+source .venv/bin/activate
+jupyter lab part1/project1.ipynb
 ```
 
-Each `part{N}` folder contains a tutorial notebook `tutorial.ipynb` and project instructions in `project.ipynb`.
+Real-data access requires accepting the WildGuardMix terms and `hf auth login`.
+The notebook uses the existing login without displaying its token. For a quick
+offline check, set `use_toy_data = True` in its settings cell. Toy results are
+labelled `SMOKE_NOT_SCIENTIFIC`. Normal results use only filtered training data;
+the official test remains untouched.
 
-## Alternatives
-
-### Using `uv`
-
-[`uv`](https://docs.astral.sh/uv/) is a fast, modern Python package manager that is quickly becoming the industry standard. It is fully compliant with Python standards, fully replaces `pip`, and interoperates well with PyTorch. To use it for this project:
-
-1. [Install `uv`](https://docs.astral.sh/uv/getting-started/installation/)
-
-2. Change the working directory:
-
-    ```shell
-    cd ./nlp1-student
-    ```
-
-3. Initialize the project
-
-    ```shell
-    uv init --bare .
-    ```
-
-    Notice the added file `pyproject.toml` file. This is where all metadata about this project/directory gets stored. You can read more about it [here](https://packaging.python.org/en/latest/guides/writing-pyproject-toml/).
-
-    At the moment, it should look something like:
-
-    ```toml
-    [project]
-    name = "nlp1-student"
-    version = "0.1.0"
-    requires-python = ">=3.14"
-    dependencies = []
-    ```
-
-4. Install dependencies
-
-    We're going to read the required dependencies from the provided `requirements.txt` file, and let `uv` handle installing the right versions
-
-    ```shell
-    uv add -r requirements.txt
-    ```
-
-    Note the new folder `.venv`. This is where all our dependencies live. Feel free to delete it once you're done, `uv` can quickly reconstruct it from its cache.
-
-    In `pyproject.toml` the `dependencies` argument is now populated.
-
-We can now use this virtual environment as we before
-
-```shell
-source .venv
-```
-
-Most modern IDEs (e.g., vscode or vscodium) should be able to recognize this virtual environment and load it for you.
-
-### Using `vscode`
-
-[Visual Studio Code (vscode)](https://code.visualstudio.com/) and its open-source twin [vscodium](https://vscodium.com/) are modern language agnostic text editors (read, IDE-lite). You can also use them for working with Jupyter or `.ipynb` notebooks. While these do not enjoy first-class support, the benefit of an IDE is that you can also access the terminal, edit regular `.py` files, and read all other files in the directory.
-
-To use either for this project, we'll need to do a few extra steps.
-
-1. Install and enable the [`Python`](https://open-vsx.org/vscode/item?itemName=ms-python.python) extension
-2. Install and enable the [`Jupyter`](https://open-vsx.org/vscode/item?itemName=ms-toolsai.jupyter) extension
-3. If necessary, install the `jupyter` package
-
-    ```shell
-    uv add jupyter 
-    ```
-
-4. When opening the notebook, use the 'Select kernel' dropdown, and select `.venv` (located as `./.venv/bin/python`)
-
-You should now be able to read, edit and run the various `*.ipynb` notebooks in this directory
-
-You can read more about the features vscode has for notebooks [here](https://code.visualstudio.com/docs/datascience/jupyter-notebooks).
-
-#### Mermaid Diagrams
-
-Some of the notebooks use [`mermaid`](https://mermaid.js.org/) diagrams. For example:
-
-```mermaid
-    flowchart LR
-
-    A["foo"] --> B(bar) --> C["baz"]
-```
-
-If these are not rendering automatically (i.e., you see text instead of a diagram), you might need to upgrade your vscode instance to at least version [1.121.0](https://code.visualstudio.com/updates/v1_121#_mermaid-diagrams-in-markdown-preview-and-notebooks). If this is not possible, you should also be able to replicate this effect by installing the [Markdown Preview Mermaid Support](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid).
-
-## Snellius
-
-If you'd like to run your tutorial notebooks via Snellius, either on CPU or GPU nodes, you can follow the instructions found [here](https://docs.google.com/document/d/18Ql8Hv-ibAGCTBvqmPVSaXBNNBSl1mtnpT8tIyoRPZM/edit?usp=sharing).
+Results are generated locally under `part1/results/`. Raw prompts, credentials
+and notebook outputs should not be committed. AI assistance is disclosed in
+the notebook. Nothing has been published to GitHub; the current `origin` is
+still the course repository and must not be used for a push.
