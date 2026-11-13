@@ -20,3 +20,4 @@ __pycache__/
 *.joblib
 part1/results/
 tmp/
+part2/glove.2024.wikigiga.50d.zip
