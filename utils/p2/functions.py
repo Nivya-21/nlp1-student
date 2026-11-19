@@ -184,6 +184,8 @@ def classification_scores(gold, predictions) -> dict:
     return {
         "macro_f1": float(f1_score(gold, predictions, labels=[0, 1], average="macro", zero_division=0)),
         "accuracy": float(accuracy_score(gold, predictions)),
+        "unharmful_f1": float(f1_score(gold, predictions, pos_label=0, zero_division=0)),
+        "harmful_f1": float(f1_score(gold, predictions, pos_label=1, zero_division=0)),
         "harmful_recall": float(tp / (tp + fn)) if tp + fn else 0.0,
         "benign_fpr": float(fp / (tn + fp)) if tn + fp else 0.0,
         "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
@@ -213,27 +215,71 @@ def nearest_words(embeddings, word, k=5):
                          "cosine": scores[indices]})
 
 
-def prepare_fold(training, validation, embeddings, tokenizer):
-    """Keep training-token rows to make trainable embeddings affordable.
+def prepare_fold(training, validation, embeddings, tokenizer, *,
+                 vocab_mode="train_full", random_std=0.1):
+    """Fit one deterministic vocabulary using the training fold only.
 
-    The vocabulary is fixed using training text only. Validation-only tokens map
-    to UNK, including words present in the full pretrained table. All compared
-    systems use this same restricted vocabulary.
+    ``train_full`` gives every observed training word a distinct row. GloVe
+    misses receive the same seeded random base row in the pretrained and random
+    initialization conditions. ``glove_only_baseline`` reproduces the older
+    behavior where training words absent from GloVe map to UNK.
     """
+    if vocab_mode not in {"train_full", "glove_only_baseline"}:
+        raise ValueError(f"Unknown vocabulary mode: {vocab_mode}")
+    if random_std <= 0:
+        raise ValueError("random_std must be positive")
+    if set(training["id"]) & set(validation["id"]):
+        raise ValueError("Training and validation IDs overlap")
     training_tokens = [tokenizer.tokens(text) for text in training.prompt]
     validation_tokens = [tokenizer.tokens(text) for text in validation.prompt]
     words = sorted({token for row in training_tokens for token in row})
     vocabulary = Vocabulary([embeddings.pad_token, embeddings.unk_token], embeddings.unk_token)
     for word in words:
-        if word in embeddings.vocab:
+        if vocab_mode == "train_full" or word in embeddings.vocab:
             vocabulary.add(word)
     vocabulary.freeze()
-    vectors = np.stack([embeddings.vectors[embeddings.vocab.index(word)] for word in vocabulary])
+
+    # Rows absent from GloVe remain zero here. ``initial_embedding_matrix``
+    # fills them from the same random base used by the random condition.
+    vectors = np.zeros((len(vocabulary), embeddings.num_dims), dtype=np.float32)
+    pretrained_mask = np.zeros(len(vocabulary), dtype=bool)
+    for index, word in enumerate(vocabulary):
+        if word in embeddings.vocab:
+            vectors[index] = embeddings.vectors[embeddings.vocab.index(word)]
+            pretrained_mask[index] = True
+    pad_index = vocabulary.index(embeddings.pad_token)
+    unk_index = vocabulary.index(embeddings.unk_token)
+    if pad_index != 0 or unk_index != 1:
+        raise ValueError("Expected PAD=0 and UNK=1")
+    vectors[pad_index] = 0
+
     def encode(rows):
         return [[vocabulary.index(token) for token in row] or [vocabulary.default_index] for row in rows]
     return {"vectors": vectors, "vocab": vocabulary,
+            "pretrained_mask": pretrained_mask, "vocab_mode": vocab_mode,
+            "random_std": float(random_std), "pad_index": pad_index, "unk_index": unk_index,
             "train_ids": encode(training_tokens), "validation_ids": encode(validation_tokens),
             "train": training, "validation": validation}
+
+
+def initial_embedding_matrix(prepared, initialization, seed):
+    """Create a matched random base and optionally overlay available GloVe rows."""
+    if initialization not in {"pretrained", "random"}:
+        raise ValueError(f"Unknown initialization: {initialization}")
+    shape = prepared["vectors"].shape
+    generator = torch.Generator().manual_seed(seed)
+    random_matrix = torch.randn(shape, generator=generator) * prepared["random_std"]
+    random_matrix[prepared["pad_index"]].zero_()
+    # Keep special symbols identical across the two initialization conditions.
+    random_matrix[prepared["unk_index"]] = torch.tensor(
+        prepared["vectors"][prepared["unk_index"]], dtype=torch.float32)
+    if initialization == "random":
+        return random_matrix
+    matrix = random_matrix.clone()
+    mask = torch.tensor(prepared["pretrained_mask"], dtype=torch.bool)
+    matrix[mask] = torch.tensor(prepared["vectors"][mask.numpy()], dtype=torch.float32)
+    matrix[prepared["pad_index"]].zero_()
+    return matrix
 
 
 def run_configuration(prepared, config, *, seed, epochs, batch_size, learning_rate,
@@ -246,30 +292,30 @@ def run_configuration(prepared, config, *, seed, epochs, batch_size, learning_ra
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
-    matrix = torch.tensor(prepared["vectors"], dtype=torch.float32)
-    if config.get("initialization", "pretrained") == "random":
-        generator = torch.Generator().manual_seed(seed)
-        scale = float(matrix[2:].std()) if len(matrix) > 2 else 0.1
-        matrix = torch.randn(matrix.shape, generator=generator) * scale
-        matrix[0].zero_()
+    initialization = config.get("initialization", "pretrained")
+    matrix = initial_embedding_matrix(prepared, initialization, seed)
+    # Matrix construction uses a dedicated generator. Resetting here guarantees
+    # matched downstream initialization for pretrained versus random systems.
+    torch.manual_seed(seed)
     freeze = config.get("frozen", True)
     if config["encoder"] == "lstm":
         encoder = clslib.LSTMEncoder(config.get("hidden_size", 64), matrix,
-                                    padding_idx=0, freeze_embeddings=freeze)
+                                    padding_idx=prepared["pad_index"], freeze_embeddings=freeze,
+                                    word_dropout=config.get("word_dropout", 0.0))
     else:
         encoder = clslib.EmbedAndPoolEncoder(matrix, average_pool=config["encoder"] == "mean",
-                                            padding_idx=0, freeze_embeddings=freeze)
+                                            padding_idx=prepared["pad_index"], freeze_embeddings=freeze)
     model = clslib.SoftmaxRegressor(config.get("classifier_width", 64),
                                    config.get("classifier_width", 64), 2, encoder,
                                    dropout=config.get("dropout", 0.2)).to(device)
     train_loader = DataLoader(
         experiment.LabelledCorpus(prepared["train_ids"], prepared["train"].label.tolist()),
         batch_size=batch_size, shuffle=True, generator=torch.Generator().manual_seed(seed),
-        collate_fn=partial(experiment.collate_labelled_texts, padding_value=0))
+        collate_fn=partial(experiment.collate_labelled_texts, padding_value=prepared["pad_index"]))
     validation_loader = DataLoader(
         experiment.LabelledCorpus(prepared["validation_ids"], prepared["validation"].label.tolist()),
         batch_size=batch_size, shuffle=False,
-        collate_fn=partial(experiment.collate_labelled_texts, padding_value=0))
+        collate_fn=partial(experiment.collate_labelled_texts, padding_value=prepared["pad_index"]))
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                  lr=learning_rate, weight_decay=weight_decay)
     criterion = torch.nn.NLLLoss()
@@ -302,16 +348,21 @@ def run_configuration(prepared, config, *, seed, epochs, batch_size, learning_ra
     predictions["confidence"] = probabilities.max(axis=1)
     result = {**config, "seed": seed, "epochs": epochs, "n_train": len(prepared["train"]),
               "n_validation": len(predictions), "trainable_parameters": trainable_parameters(model),
+              "vocab_mode": prepared["vocab_mode"], "vocabulary_size": len(prepared["vocab"]),
+              "glove_rows": int(prepared["pretrained_mask"].sum()),
+              "random_rows": int((~prepared["pretrained_mask"]).sum()),
+              "random_std": prepared["random_std"],
               "device": device, "fit_seconds": time.perf_counter() - started,
               **classification_scores(predictions.gold, predictions.prediction)}
     return result, pd.DataFrame(history), predictions
 
 
-def input_features(text, tokenizer, vocabulary):
+def input_features(text, tokenizer, training_vocabulary, glove_vocabulary):
     """Pre-specified descriptive features; they do not enter the classifier."""
     tokens = tokenizer.tokens(text)
     return {"token_length": len(tokens),
-            "oov_fraction": sum(token not in vocabulary for token in tokens) / max(1, len(tokens)),
+            "glove_oov_fraction": sum(token not in glove_vocabulary for token in tokens) / max(1, len(tokens)),
+            "train_vocab_oov_fraction": sum(token not in training_vocabulary for token in tokens) / max(1, len(tokens)),
             "has_negation": bool(re.search(r"\b(no|not|never)\b|n't\b", text.lower())),
             "has_security_term": any(token in {"authentication", "bypass", "fraud", "mfa", "phishing", "scam"}
                                      for token in tokens)}
