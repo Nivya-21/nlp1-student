@@ -7,11 +7,13 @@ only operations that are reused or easier to test outside a notebook.
 from __future__ import annotations
 
 import hashlib
+import json
 import random
 import re
 import time
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import nltk
@@ -216,68 +218,108 @@ def nearest_words(embeddings, word, k=5):
 
 
 def prepare_fold(training, validation, embeddings, tokenizer, *,
-                 vocab_mode="train_full", random_std=0.1):
-    """Fit one deterministic vocabulary using the training fold only.
+                 vocab_mode="full_train", min_frequency=1):
+    """Fit a deterministic model vocabulary from training text only.
 
-    ``train_full`` gives every observed training word a distinct row. GloVe
-    misses receive the same seeded random base row in the pretrained and random
-    initialization conditions. ``glove_only_baseline`` reproduces the older
-    behavior where training words absent from GloVe map to UNK.
+    ``full_train`` is the primary inductive policy: every distinct training
+    token receives a row. ``glove_restricted`` retains only training words found
+    in GloVe. ``frequency_pruned`` retains words meeting ``min_frequency``.
+    Validation tokens never expand or reorder the matrix, even if GloVe knows
+    them; unseen validation tokens map to UNK.
     """
-    if vocab_mode not in {"train_full", "glove_only_baseline"}:
+    if vocab_mode not in {"full_train", "glove_restricted", "frequency_pruned"}:
         raise ValueError(f"Unknown vocabulary mode: {vocab_mode}")
-    if random_std <= 0:
-        raise ValueError("random_std must be positive")
+    if not isinstance(min_frequency, int) or min_frequency < 1:
+        raise ValueError("min_frequency must be a positive integer")
     if set(training["id"]) & set(validation["id"]):
         raise ValueError("Training and validation IDs overlap")
     training_tokens = [tokenizer.tokens(text) for text in training.prompt]
     validation_tokens = [tokenizer.tokens(text) for text in validation.prompt]
-    words = sorted({token for row in training_tokens for token in row})
-    vocabulary = Vocabulary([embeddings.pad_token, embeddings.unk_token], embeddings.unk_token)
-    for word in words:
-        if vocab_mode == "train_full" or word in embeddings.vocab:
-            vocabulary.add(word)
+    counts = Counter(token for row in training_tokens for token in row)
+
+    reserved = {embeddings.pad_token, embeddings.unk_token}
+    if vocab_mode == "full_train":
+        retained_words = sorted(set(counts).difference(reserved))
+    elif vocab_mode == "glove_restricted":
+        retained_words = sorted(
+            word for word in counts if word not in reserved and word in embeddings.vocab)
+    else:
+        retained_words = sorted(
+            word for word, frequency in counts.items()
+            if word not in reserved and frequency >= min_frequency)
+
+    vocabulary = Vocabulary(
+        [embeddings.pad_token, embeddings.unk_token], embeddings.unk_token)
+    for word in retained_words:
+        vocabulary.add(word)
     vocabulary.freeze()
 
-    # Rows absent from GloVe remain zero here. ``initial_embedding_matrix``
-    # fills them from the same random base used by the random condition.
-    vectors = np.zeros((len(vocabulary), embeddings.num_dims), dtype=np.float32)
+    pretrained_vectors = np.zeros((len(vocabulary), embeddings.num_dims), dtype=np.float32)
     pretrained_mask = np.zeros(len(vocabulary), dtype=bool)
-    for index, word in enumerate(vocabulary):
-        if word in embeddings.vocab:
-            vectors[index] = embeddings.vectors[embeddings.vocab.index(word)]
+    for index, word in vocabulary.items():
+        if index >= 2 and word in embeddings.vocab:
+            pretrained_vectors[index] = embeddings.vectors[embeddings.vocab.index(word)]
             pretrained_mask[index] = True
     pad_index = vocabulary.index(embeddings.pad_token)
     unk_index = vocabulary.index(embeddings.unk_token)
     if pad_index != 0 or unk_index != 1:
         raise ValueError("Expected PAD=0 and UNK=1")
-    vectors[pad_index] = 0
-
+    if vocab_mode == "glove_restricted":
+        pretrained_vectors[unk_index] = embeddings.vectors[
+            embeddings.vocab.index(embeddings.unk_token)
+        ]
     def encode(rows):
         return [[vocabulary.index(token) for token in row] or [vocabulary.default_index] for row in rows]
-    return {"vectors": vectors, "vocab": vocabulary,
+    if not hasattr(embeddings, "_random_initialization_moments"):
+        observed_vectors = embeddings.vectors[2:]
+        embeddings._random_initialization_moments = (
+            observed_vectors.mean(axis=0).astype(np.float32),
+            np.maximum(observed_vectors.std(axis=0), 1e-6).astype(np.float32),
+        )
+    random_mean, random_std = embeddings._random_initialization_moments
+    return {"pretrained_vectors": pretrained_vectors,
+            "embedding_dims": embeddings.num_dims,
+            "vocab": vocabulary,
+            "tokenizer_policy": {
+                "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
+                "lowercase": bool(tokenizer.lowercase),
+                "remove_punct": bool(tokenizer.remove_punct),
+                "remove_stopwords": bool(tokenizer.remove_stopwords),
+                "language": tokenizer.language,
+            },
             "pretrained_mask": pretrained_mask, "vocab_mode": vocab_mode,
-            "random_std": float(random_std), "pad_index": pad_index, "unk_index": unk_index,
+            "min_frequency": min_frequency,
+            "training_token_set": frozenset(counts),
+            "training_types": len(set(counts).difference(reserved)),
+            "dedicated_glove_rows": int(pretrained_mask.sum()),
+            "dedicated_random_rows": int(len(vocabulary) - 2 - pretrained_mask.sum()),
+            "pruned_training_types": int(
+                len(set(counts).difference(reserved)) - len(retained_words)),
+            "random_mean": random_mean, "random_std": random_std,
+            "pad_index": pad_index, "unk_index": unk_index,
             "train_ids": encode(training_tokens), "validation_ids": encode(validation_tokens),
             "train": training, "validation": validation}
 
 
 def initial_embedding_matrix(prepared, initialization, seed):
-    """Create a matched random base and optionally overlay available GloVe rows."""
+    """Create a scale-matched random base and optionally overlay GloVe rows."""
     if initialization not in {"pretrained", "random"}:
         raise ValueError(f"Unknown initialization: {initialization}")
-    shape = prepared["vectors"].shape
+    shape = (len(prepared["vocab"]), prepared["embedding_dims"])
     generator = torch.Generator().manual_seed(seed)
-    random_matrix = torch.randn(shape, generator=generator) * prepared["random_std"]
+    mean = torch.tensor(prepared["random_mean"], dtype=torch.float32)
+    std = torch.tensor(prepared["random_std"], dtype=torch.float32)
+    random_matrix = torch.randn(shape, generator=generator) * std + mean
     random_matrix[prepared["pad_index"]].zero_()
-    # Keep special symbols identical across the two initialization conditions.
-    random_matrix[prepared["unk_index"]] = torch.tensor(
-        prepared["vectors"][prepared["unk_index"]], dtype=torch.float32)
     if initialization == "random":
         return random_matrix
-    matrix = random_matrix.clone()
-    mask = torch.tensor(prepared["pretrained_mask"], dtype=torch.bool)
-    matrix[mask] = torch.tensor(prepared["vectors"][mask.numpy()], dtype=torch.float32)
+    matrix = random_matrix
+    mask = torch.from_numpy(prepared["pretrained_mask"])
+    matrix[mask] = torch.from_numpy(prepared["pretrained_vectors"][prepared["pretrained_mask"]])
+    if prepared["vocab_mode"] == "glove_restricted":
+        matrix[prepared["unk_index"]] = torch.from_numpy(
+            prepared["pretrained_vectors"][prepared["unk_index"]]
+        )
     matrix[prepared["pad_index"]].zero_()
     return matrix
 
@@ -316,8 +358,17 @@ def run_configuration(prepared, config, *, seed, epochs, batch_size, learning_ra
         experiment.LabelledCorpus(prepared["validation_ids"], prepared["validation"].label.tolist()),
         batch_size=batch_size, shuffle=False,
         collate_fn=partial(experiment.collate_labelled_texts, padding_value=prepared["pad_index"]))
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
-                                 lr=learning_rate, weight_decay=weight_decay)
+    embedding_parameter = model.encoder.embedding.weight
+    embedding_learning_rate = config.get("embedding_learning_rate", learning_rate)
+    other_parameters = [parameter for parameter in model.parameters()
+                        if parameter.requires_grad and parameter is not embedding_parameter]
+    parameter_groups = [{"params": other_parameters, "lr": learning_rate,
+                         "weight_decay": weight_decay}]
+    if embedding_parameter.requires_grad:
+        parameter_groups.append({"params": [embedding_parameter],
+                                 "lr": embedding_learning_rate,
+                                 "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(parameter_groups)
     criterion = torch.nn.NLLLoss()
     history = []
     started = time.perf_counter()
@@ -340,6 +391,9 @@ def run_configuration(prepared, config, *, seed, epochs, batch_size, learning_ra
             probabilities.append(model(inputs.to(device)).exp().cpu().numpy())
     probabilities = np.concatenate(probabilities)
     np.testing.assert_allclose(probabilities.sum(axis=1), 1.0, atol=1e-5)
+    pad_row = model.encoder.embedding.weight[prepared["pad_index"]].detach().cpu()
+    if not torch.equal(pad_row, torch.zeros_like(pad_row)):
+        raise AssertionError("PAD embedding changed during optimization")
     predictions = prepared["validation"][["id", "label"]].rename(columns={"label": "gold"}).copy()
     predictions["system"] = config["name"]
     predictions["seed"] = seed
@@ -349,20 +403,81 @@ def run_configuration(prepared, config, *, seed, epochs, batch_size, learning_ra
     result = {**config, "seed": seed, "epochs": epochs, "n_train": len(prepared["train"]),
               "n_validation": len(predictions), "trainable_parameters": trainable_parameters(model),
               "vocab_mode": prepared["vocab_mode"], "vocabulary_size": len(prepared["vocab"]),
-              "glove_rows": int(prepared["pretrained_mask"].sum()),
-              "random_rows": int((~prepared["pretrained_mask"]).sum()),
-              "random_std": prepared["random_std"],
+              "glove_rows": prepared["dedicated_glove_rows"],
+              "random_rows": prepared["dedicated_random_rows"],
+              "pruned_training_types": prepared["pruned_training_types"],
+              "min_frequency": prepared["min_frequency"],
+              "embedding_learning_rate": embedding_learning_rate,
               "device": device, "fit_seconds": time.perf_counter() - started,
               **classification_scores(predictions.gold, predictions.prediction)}
     return result, pd.DataFrame(history), predictions
 
 
-def input_features(text, tokenizer, training_vocabulary, glove_vocabulary):
+def input_features(text, tokenizer, training_token_set, model_vocabulary, glove_vocabulary):
     """Pre-specified descriptive features; they do not enter the classifier."""
     tokens = tokenizer.tokens(text)
     return {"token_length": len(tokens),
             "glove_oov_fraction": sum(token not in glove_vocabulary for token in tokens) / max(1, len(tokens)),
-            "train_vocab_oov_fraction": sum(token not in training_vocabulary for token in tokens) / max(1, len(tokens)),
+            "train_vocab_oov_fraction": sum(token not in training_token_set for token in tokens) / max(1, len(tokens)),
+            "model_unk_fraction": sum(token not in model_vocabulary for token in tokens) / max(1, len(tokens)),
             "has_negation": bool(re.search(r"\b(no|not|never)\b|n't\b", text.lower())),
             "has_security_term": any(token in {"authentication", "bypass", "fraud", "mfa", "phishing", "scam"}
                                      for token in tokens)}
+
+
+def experiment_signature(config, training_ids, validation_ids, *, seed, epochs):
+    """Hash the resolved fit inputs so interrupted runs can resume safely."""
+    payload = {
+        "config": config,
+        "training_ids": sorted(map(str, training_ids)),
+        "validation_ids": sorted(map(str, validation_ids)),
+        "seed": int(seed),
+        "epochs": int(epochs),
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def file_identity(path):
+    """Return a stable content identity for an experimental input or implementation file."""
+    path = Path(path).resolve()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return {"path": str(path), "size_bytes": path.stat().st_size,
+            "sha256": digest.hexdigest()}
+
+
+def save_fit_artifacts(folder, signature, score, history, predictions):
+    """Atomically save one completed fit; the completion marker is written last."""
+    fit_folder = Path(folder) / "fits" / signature
+    fit_folder.mkdir(parents=True, exist_ok=True)
+    artifacts = {
+        "score.json": json.dumps(score, indent=2, default=str),
+        "history.csv": history.to_csv(index=False),
+        "predictions.csv": predictions.to_csv(index=False),
+    }
+    for name, content in artifacts.items():
+        temporary = fit_folder / f"{name}.tmp"
+        temporary.write_text(content)
+        temporary.replace(fit_folder / name)
+    marker = fit_folder / "complete.json.tmp"
+    marker.write_text(json.dumps({"signature": signature, "status": "COMPLETE"}, indent=2))
+    marker.replace(fit_folder / "complete.json")
+    return fit_folder
+
+
+def load_fit_artifacts(folder, signature):
+    """Load a valid completed fit, or return ``None`` when it must be rerun."""
+    fit_folder = Path(folder) / "fits" / signature
+    marker = fit_folder / "complete.json"
+    required = [fit_folder / "score.json", fit_folder / "history.csv",
+                fit_folder / "predictions.csv"]
+    if not marker.exists() or not all(path.exists() for path in required):
+        return None
+    status = json.loads(marker.read_text())
+    if status != {"signature": signature, "status": "COMPLETE"}:
+        return None
+    return (json.loads(required[0].read_text()),
+            pd.read_csv(required[1]), pd.read_csv(required[2]))
