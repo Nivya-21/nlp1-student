@@ -214,12 +214,14 @@ def nearest_words(embeddings, word, k=5):
 
 
 def prepare_fold(training, validation, embeddings, tokenizer):
-    """Keep training-token rows to make trainable embeddings affordable.
+    """Build the original training-only, GloVe-restricted vocabulary.
 
-    The vocabulary is fixed using training text only. Validation-only tokens map
-    to UNK, including words present in the full pretrained table. All compared
-    systems use this same restricted vocabulary.
+    Only training words covered by GloVe receive individual rows. Every other
+    token maps to the shared course UNK row; validation never expands the
+    vocabulary.
     """
+    if set(training["id"]) & set(validation["id"]):
+        raise ValueError("Training and validation IDs overlap")
     training_tokens = [tokenizer.tokens(text) for text in training.prompt]
     validation_tokens = [tokenizer.tokens(text) for text in validation.prompt]
     words = sorted({token for row in training_tokens for token in row})
@@ -229,9 +231,14 @@ def prepare_fold(training, validation, embeddings, tokenizer):
             vocabulary.add(word)
     vocabulary.freeze()
     vectors = np.stack([embeddings.vectors[embeddings.vocab.index(word)] for word in vocabulary])
+    pad_index = vocabulary.index(embeddings.pad_token)
+    unk_index = vocabulary.index(embeddings.unk_token)
+    if pad_index != 0 or unk_index != 1:
+        raise ValueError("Expected PAD=0 and UNK=1")
     def encode(rows):
         return [[vocabulary.index(token) for token in row] or [vocabulary.default_index] for row in rows]
     return {"vectors": vectors, "vocab": vocabulary,
+            "pad_index": pad_index, "unk_index": unk_index,
             "train_ids": encode(training_tokens), "validation_ids": encode(validation_tokens),
             "train": training, "validation": validation}
 
@@ -251,25 +258,31 @@ def run_configuration(prepared, config, *, seed, epochs, batch_size, learning_ra
         generator = torch.Generator().manual_seed(seed)
         scale = float(matrix[2:].std()) if len(matrix) > 2 else 0.1
         matrix = torch.randn(matrix.shape, generator=generator) * scale
-        matrix[0].zero_()
+        matrix[prepared["pad_index"]].zero_()
+    initial_matrix = matrix.clone()
+    # Matrix sampling uses a dedicated generator. Resetting here keeps the
+    # classifier initialization matched between pretrained and random systems.
+    torch.manual_seed(seed)
     freeze = config.get("frozen", True)
     if config["encoder"] == "lstm":
         encoder = clslib.LSTMEncoder(config.get("hidden_size", 64), matrix,
-                                    padding_idx=0, freeze_embeddings=freeze)
+                                    padding_idx=prepared["pad_index"], freeze_embeddings=freeze)
     else:
         encoder = clslib.EmbedAndPoolEncoder(matrix, average_pool=config["encoder"] == "mean",
-                                            padding_idx=0, freeze_embeddings=freeze)
+                                            padding_idx=prepared["pad_index"], freeze_embeddings=freeze)
     model = clslib.SoftmaxRegressor(config.get("classifier_width", 64),
                                    config.get("classifier_width", 64), 2, encoder,
                                    dropout=config.get("dropout", 0.2)).to(device)
     train_loader = DataLoader(
         experiment.LabelledCorpus(prepared["train_ids"], prepared["train"].label.tolist()),
         batch_size=batch_size, shuffle=True, generator=torch.Generator().manual_seed(seed),
-        collate_fn=partial(experiment.collate_labelled_texts, padding_value=0))
+        collate_fn=partial(experiment.collate_labelled_texts,
+                           padding_value=prepared["pad_index"]))
     validation_loader = DataLoader(
         experiment.LabelledCorpus(prepared["validation_ids"], prepared["validation"].label.tolist()),
         batch_size=batch_size, shuffle=False,
-        collate_fn=partial(experiment.collate_labelled_texts, padding_value=0))
+        collate_fn=partial(experiment.collate_labelled_texts,
+                           padding_value=prepared["pad_index"]))
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                  lr=learning_rate, weight_decay=weight_decay)
     criterion = torch.nn.NLLLoss()
@@ -300,8 +313,11 @@ def run_configuration(prepared, config, *, seed, epochs, batch_size, learning_ra
     predictions["prediction"] = probabilities.argmax(axis=1)
     predictions["probability_harmful"] = probabilities[:, 1]
     predictions["confidence"] = probabilities.max(axis=1)
+    final_matrix = model.encoder.embedding.weight.detach().cpu()
+    embedding_changed = not torch.equal(initial_matrix, final_matrix)
     result = {**config, "seed": seed, "epochs": epochs, "n_train": len(prepared["train"]),
               "n_validation": len(predictions), "trainable_parameters": trainable_parameters(model),
+              "embedding_changed": embedding_changed,
               "device": device, "fit_seconds": time.perf_counter() - started,
               **classification_scores(predictions.gold, predictions.prediction)}
     return result, pd.DataFrame(history), predictions
